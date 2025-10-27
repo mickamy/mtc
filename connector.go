@@ -89,6 +89,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 		tx, txErr = cbtx.BeginTx(ctx, opts)
 	} else {
 		// Fallback to legacy Begin() if ConnBeginTx is not implemented
+		//lint:ignore SA1019 legacy drivers still rely on Conn.Begin fallback.
 		tx, txErr = c.Conn.Begin()
 	}
 	if txErr != nil {
@@ -163,6 +164,7 @@ func execContext(ctx context.Context, cn driver.Conn, query string, args ...driv
 	for i, nv := range args {
 		vals[i] = nv.Value
 	}
+	//lint:ignore SA1019 fallback for drivers that only implement legacy Stmt.Exec.
 	if _, err := stmt.Exec(vals); err != nil {
 		return fmt.Errorf("mtc: failed to execute legacy query %q: %w", query, err)
 	}
