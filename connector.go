@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 )
 
 // TenantIDFunc defines a function that extracts tenant ID from context.Context.
@@ -69,6 +70,48 @@ type conn struct {
 	driver.Conn
 	tenantIDFn  TenantIDFunc
 	settingName string
+}
+
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	execerCtx, ok := c.Conn.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+
+	cleanup, err := c.attachTenantSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	res, execErr := execerCtx.ExecContext(ctx, query, args)
+	if cerr := cleanup(ctx); cerr != nil && execErr == nil {
+		execErr = cerr
+	}
+	return res, execErr
+}
+
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	queryerCtx, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+
+	cleanup, err := c.attachTenantSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, queryErr := queryerCtx.QueryContext(ctx, query, args)
+	if queryErr != nil {
+		_ = cleanup(ctx)
+		return nil, queryErr
+	}
+
+	return &tenantAwareRows{
+		Rows:    rows,
+		cleanup: cleanup,
+		ctx:     ctx,
+	}, nil
 }
 
 // ResetSession is called when the connection is taken from the pool.
@@ -171,8 +214,75 @@ func execContext(ctx context.Context, cn driver.Conn, query string, args ...driv
 	return nil
 }
 
+func (c *conn) attachTenantSession(ctx context.Context) (func(context.Context) error, error) {
+	tenantID, err := c.tenantIDFn(ctx)
+	if err != nil || tenantID == "" {
+		// Ensure previous session-level values are cleared when no tenant is supplied.
+		if err := resetSetting(ctx, c.Conn, c.settingName); err != nil {
+			return nil, fmt.Errorf("mtc: failed to reset %s: %w", c.settingName, err)
+		}
+		return func(context.Context) error { return nil }, nil
+	}
+
+	if err := execContext(
+		ctx,
+		c.Conn,
+		"SELECT set_config($1, $2, false)",
+		driver.NamedValue{Ordinal: 1, Value: c.settingName},
+		driver.NamedValue{Ordinal: 2, Value: tenantID},
+	); err != nil {
+		return nil, fmt.Errorf("mtc: failed to set %s: %w", c.settingName, err)
+	}
+
+	return func(cleanCtx context.Context) error {
+		return resetSetting(cleanCtx, c.Conn, c.settingName)
+	}, nil
+}
+
+type tenantAwareRows struct {
+	driver.Rows
+	cleanup func(context.Context) error
+	ctx     context.Context
+	once    sync.Once
+}
+
+func (r *tenantAwareRows) Close() error {
+	closeErr := r.Rows.Close()
+	cleanupErr := r.runCleanup()
+	if closeErr != nil {
+		return closeErr
+	}
+	return cleanupErr
+}
+
+func (r *tenantAwareRows) runCleanup() error {
+	var cleanupErr error
+	r.once.Do(func() {
+		if r.cleanup != nil {
+			cleanupErr = r.cleanup(r.ctx)
+		}
+	})
+	return cleanupErr
+}
+
+func (r *tenantAwareRows) NextResultSet() error {
+	if nrs, ok := r.Rows.(driver.RowsNextResultSet); ok {
+		return nrs.NextResultSet()
+	}
+	return driver.ErrSkip
+}
+
+func (r *tenantAwareRows) HasNextResultSet() bool {
+	if nrs, ok := r.Rows.(driver.RowsNextResultSet); ok {
+		return nrs.HasNextResultSet()
+	}
+	return false
+}
+
 var (
 	_ driver.Connector       = (*Connector)(nil)
 	_ driver.SessionResetter = (*conn)(nil)
 	_ driver.ConnBeginTx     = (*conn)(nil)
+	_ driver.ExecerContext   = (*conn)(nil)
+	_ driver.QueryerContext  = (*conn)(nil)
 )

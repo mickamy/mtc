@@ -6,7 +6,9 @@ Row-Level Security (RLS).
 
 ## Features
 
-- Propagates tenant IDs from `context.Context` into transaction-local GUCs.
+- Propagates tenant IDs from `context.Context` into PostgreSQL GUCs.
+- Applies the tenant both for explicit transactions (`BeginTx`) and autocommit statements (`QueryContext`,
+  `ExecContext`) by bracketing each query with `set_config(..., false)` / `RESET`.
 - Works with any `database/sql` driver; pgx is supported out of the box.
 - Validates tenant setting name to avoid SQL injection (`reset setting` safety).
 - Keeps session state clean by resetting the tenant setting on pooled connections.
@@ -52,13 +54,19 @@ func main() {
 
 	ctx := context.WithValue(context.Background(), tenantKey{}, "tenant-123")
 
+	var tenant string
+	if err := db.QueryRowContext(ctx, "select current_setting('app.tenant_id', true)").Scan(&tenant); err != nil {
+		panic(err)
+	}
+	fmt.Println("tenant:", tenant)
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		panic(err)
 	}
 	defer tx.Rollback()
 
-	// Within this transaction the tenant is visible via current_setting.
+	// Within this transaction the tenant is visible via current_setting as well.
 }
 ```
 
