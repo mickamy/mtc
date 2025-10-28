@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mickamy/mtc"

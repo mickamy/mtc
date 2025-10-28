@@ -73,17 +73,12 @@ type conn struct {
 }
 
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	execerCtx, ok := c.Conn.(driver.ExecerContext)
-	if !ok {
-		return nil, driver.ErrSkip
-	}
-
 	cleanup, err := c.attachTenantSession(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	res, execErr := execerCtx.ExecContext(ctx, query, args)
+	res, execErr := c.exec(ctx, query, args)
 	if cerr := cleanup(ctx); cerr != nil && execErr == nil {
 		execErr = cerr
 	}
@@ -91,27 +86,106 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	queryerCtx, ok := c.Conn.(driver.QueryerContext)
-	if !ok {
-		return nil, driver.ErrSkip
-	}
-
 	cleanup, err := c.attachTenantSession(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	rows, queryErr := queryerCtx.QueryContext(ctx, query, args)
+	rows, cleanupFn, queryErr := c.query(ctx, query, args, cleanup)
 	if queryErr != nil {
-		_ = cleanup(ctx)
+		_ = cleanupFn(ctx)
 		return nil, queryErr
 	}
 
 	return &tenantAwareRows{
 		Rows:    rows,
-		cleanup: cleanup,
+		cleanup: cleanupFn,
 		ctx:     ctx,
 	}, nil
+}
+
+// PrepareContext wraps prepared statements so that executions also enforce tenant scoping.
+func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	stmt, err := prepareStmt(ctx, c.Conn, query)
+	if err != nil {
+		return nil, fmt.Errorf("mtc: failed to prepare statement: %w", err)
+	}
+	return &tenantAwareStmt{Stmt: stmt, conn: c}, nil
+}
+
+func (c *conn) Prepare(query string) (driver.Stmt, error) {
+	stmt, err := prepareStmt(context.Background(), c.Conn, query)
+	if err != nil {
+		return nil, fmt.Errorf("mtc: failed to prepare statement: %w", err)
+	}
+	return &tenantAwareStmt{Stmt: stmt, conn: c}, nil
+}
+
+func (c *conn) exec(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if execerCtx, ok := c.Conn.(driver.ExecerContext); ok {
+		res, err := execerCtx.ExecContext(ctx, query, args)
+		if err == nil || !errors.Is(err, driver.ErrSkip) {
+			return res, err
+		}
+	}
+
+	stmt, err := prepareStmt(ctx, c.Conn, query)
+	if err != nil {
+		return nil, fmt.Errorf("mtc: failed to prepare statement for exec: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	if se, ok := stmt.(driver.StmtExecContext); ok {
+		return se.ExecContext(ctx, args)
+	}
+	return stmt.Exec(namedValueToValue(args))
+}
+
+func (c *conn) query(
+	ctx context.Context,
+	query string,
+	args []driver.NamedValue,
+	cleanup func(context.Context) error,
+) (driver.Rows, func(context.Context) error, error) {
+	if queryerCtx, ok := c.Conn.(driver.QueryerContext); ok {
+		rows, err := queryerCtx.QueryContext(ctx, query, args)
+		if err == nil || !errors.Is(err, driver.ErrSkip) {
+			return rows, cleanup, err
+		}
+	}
+
+	stmt, err := prepareStmt(ctx, c.Conn, query)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("mtc: failed to prepare statement for query: %w", err)
+	}
+
+	var (
+		rows     driver.Rows
+		queryErr error
+	)
+
+	if sqc, ok := stmt.(driver.StmtQueryContext); ok {
+		rows, queryErr = sqc.QueryContext(ctx, args)
+	} else {
+		rows, queryErr = stmt.Query(namedValueToValue(args))
+	}
+	if queryErr != nil {
+		_ = stmt.Close()
+		return nil, cleanup, queryErr
+	}
+
+	stmtCleanup := func(cleanCtx context.Context) error {
+		var firstErr error
+		if cerr := stmt.Close(); cerr != nil {
+			firstErr = fmt.Errorf("mtc: failed to close statement: %w", cerr)
+		}
+		if rerr := cleanup(cleanCtx); rerr != nil && firstErr == nil {
+			firstErr = rerr
+		}
+		return firstErr
+	}
+
+	return rows, stmtCleanup, nil
 }
 
 // ResetSession is called when the connection is taken from the pool.
@@ -214,6 +288,27 @@ func execContext(ctx context.Context, cn driver.Conn, query string, args ...driv
 	return nil
 }
 
+func prepareStmt(ctx context.Context, cn driver.Conn, query string) (driver.Stmt, error) {
+	if pc, ok := cn.(driver.ConnPrepareContext); ok {
+		return pc.PrepareContext(ctx, query)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return cn.Prepare(query)
+}
+
+func namedValueToValue(args []driver.NamedValue) []driver.Value {
+	if len(args) == 0 {
+		return nil
+	}
+	vals := make([]driver.Value, len(args))
+	for i, nv := range args {
+		vals[i] = nv.Value
+	}
+	return vals
+}
+
 func (c *conn) attachTenantSession(ctx context.Context) (func(context.Context) error, error) {
 	tenantID, err := c.tenantIDFn(ctx)
 	if err != nil || tenantID == "" {
@@ -279,10 +374,85 @@ func (r *tenantAwareRows) HasNextResultSet() bool {
 	return false
 }
 
+type tenantAwareStmt struct {
+	driver.Stmt
+	conn *conn
+}
+
+func (s *tenantAwareStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	cleanup, err := s.conn.attachTenantSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		res     driver.Result
+		execErr error
+	)
+
+	if se, ok := s.Stmt.(driver.StmtExecContext); ok {
+		res, execErr = se.ExecContext(ctx, args)
+		if errors.Is(execErr, driver.ErrSkip) {
+			execErr = nil
+			res, execErr = s.Stmt.Exec(namedValueToValue(args))
+		}
+	} else {
+		res, execErr = s.Stmt.Exec(namedValueToValue(args))
+	}
+
+	if cerr := cleanup(ctx); cerr != nil && execErr == nil {
+		execErr = cerr
+	}
+	return res, execErr
+}
+
+func (s *tenantAwareStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	cleanup, err := s.conn.attachTenantSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		rows     driver.Rows
+		queryErr error
+	)
+
+	if sqc, ok := s.Stmt.(driver.StmtQueryContext); ok {
+		rows, queryErr = sqc.QueryContext(ctx, args)
+		if errors.Is(queryErr, driver.ErrSkip) {
+			rows, queryErr = s.Stmt.Query(namedValueToValue(args))
+		}
+	} else {
+		rows, queryErr = s.Stmt.Query(namedValueToValue(args))
+	}
+
+	if queryErr != nil {
+		_ = cleanup(ctx)
+		return nil, queryErr
+	}
+
+	return &tenantAwareRows{
+		Rows:    rows,
+		cleanup: cleanup,
+		ctx:     ctx,
+	}, nil
+}
+
+func (s *tenantAwareStmt) Exec(args []driver.Value) (driver.Result, error) {
+	return s.Stmt.Exec(args)
+}
+
+func (s *tenantAwareStmt) Query(args []driver.Value) (driver.Rows, error) {
+	return s.Stmt.Query(args)
+}
+
 var (
-	_ driver.Connector       = (*Connector)(nil)
-	_ driver.SessionResetter = (*conn)(nil)
-	_ driver.ConnBeginTx     = (*conn)(nil)
-	_ driver.ExecerContext   = (*conn)(nil)
-	_ driver.QueryerContext  = (*conn)(nil)
+	_ driver.Connector          = (*Connector)(nil)
+	_ driver.SessionResetter    = (*conn)(nil)
+	_ driver.ConnBeginTx        = (*conn)(nil)
+	_ driver.ExecerContext      = (*conn)(nil)
+	_ driver.QueryerContext     = (*conn)(nil)
+	_ driver.ConnPrepareContext = (*conn)(nil)
+	_ driver.StmtExecContext    = (*tenantAwareStmt)(nil)
+	_ driver.StmtQueryContext   = (*tenantAwareStmt)(nil)
 )

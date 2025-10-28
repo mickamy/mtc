@@ -96,6 +96,21 @@ func TestIntegrationTenantSettingOutsideTx(t *testing.T) {
 	if tenant != "" {
 		t.Fatalf("expected empty tenant, got %q", tenant)
 	}
+
+	stmt, err := db.PrepareContext(ctx, "select current_setting('app.tenant_id', true)")
+	if err != nil {
+		t.Fatalf("PrepareContext() error = %v", err)
+	}
+	defer func() {
+		_ = stmt.Close()
+	}()
+
+	if err := stmt.QueryRowContext(tenantCtx).Scan(&tenant); err != nil {
+		t.Fatalf("Stmt.QueryRowContext() error = %v", err)
+	}
+	if tenant != testTenant {
+		t.Fatalf("expected tenant %q via prepared statement, got %q", testTenant, tenant)
+	}
 }
 
 func waitForPostgres(ctx context.Context, db *sql.DB) error {
